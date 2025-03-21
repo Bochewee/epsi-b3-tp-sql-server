@@ -1,0 +1,1 @@
+-- Requêtes de test pour TP_WerewolfVillage

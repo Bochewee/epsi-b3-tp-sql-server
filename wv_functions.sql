@@ -1,0 +1,1 @@
+-- Définition des fonctions pour TP_WerewolfVillage

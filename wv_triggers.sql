@@ -1,0 +1,1 @@
+-- Définition des triggers pour TP_WerewolfVillage

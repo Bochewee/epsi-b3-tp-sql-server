@@ -1,0 +1,1 @@
+-- Définition des vues pour TP_WerewolfVillage

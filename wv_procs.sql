@@ -1,0 +1,1 @@
+-- Définition des procédures stockées pour TP_WerewolfVillage
