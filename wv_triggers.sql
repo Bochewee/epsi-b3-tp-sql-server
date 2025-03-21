@@ -1,83 +1,93 @@
--- wv_triggers.sql
-USE loupgaroudb;
-
--- Trigger pour vérifier que le nombre de loups est équilibré
-CREATE OR ALTER TRIGGER trg_check_wolf_balance
-ON players_in_parties
-AFTER INSERT, UPDATE
+-- ===============================================================================================
+-- TRIGGER 1 : Déclencher la procédure COMPLETE_TOUR quand un tour est marqué comme terminé
+-- ===============================================================================================
+CREATE TRIGGER TR_COMPLETE_TOUR_ON_END
+ON turns
+AFTER UPDATE
 AS
 BEGIN
-    SET NOCOUNT ON;
-    
-    DECLARE @party_id INT;
-    DECLARE @wolf_count INT;
-    DECLARE @total_players INT;
-    DECLARE @wolf_percentage FLOAT;
-    DECLARE @wolf_role_id INT;
-    
-    -- Récupérer l'ID du rôle loup
-    SELECT @wolf_role_id = id_role FROM roles WHERE description_role = 'loup';
-    
-    -- Récupérer party_id de la ligne insérée/mise à jour
-    SELECT @party_id = id_party FROM inserted;
-    
-    -- Calculer le pourcentage de loups dans la partie
-    SELECT 
-        @wolf_count = COUNT(CASE WHEN id_role = @wolf_role_id THEN 1 END),
-        @total_players = COUNT(*)
-    FROM players_in_parties
-    WHERE id_party = @party_id;
-    
-    SET @wolf_percentage = CAST(@wolf_count AS FLOAT) / CASE WHEN @total_players = 0 THEN 1 ELSE @total_players END;
-    
-    -- Vérifier que le pourcentage de loups est entre 20% et 40%
-    IF @total_players >= 5 AND (@wolf_percentage < 0.2 OR @wolf_percentage > 0.4)
+    -- Vérifier si le champ end_time a été mis à jour et n'était pas déjà renseigné
+    IF UPDATE(end_time)
     BEGIN
-        RAISERROR('Le pourcentage de loups doit être entre 20% et 40% pour les parties avec au moins 5 joueurs.', 16, 1);
-        ROLLBACK TRANSACTION;
+        -- Récupérer les tours qui viennent d'être marqués comme terminés
+        DECLARE @id_turn INT
+        
+        -- Parcourir tous les tours qui viennent d'être fermés
+        DECLARE tour_cursor CURSOR FOR
+            SELECT i.id_turn
+            FROM inserted i
+            JOIN deleted d ON i.id_turn = d.id_turn
+            WHERE i.end_time IS NOT NULL 
+            AND d.end_time IS NULL;
+            
+        OPEN tour_cursor
+        FETCH NEXT FROM tour_cursor INTO @id_turn
+        
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            -- Exécuter la procédure COMPLETE_TOUR pour chaque tour marqué comme terminé
+            EXEC COMPLETE_TOUR @id_turn
+            
+            FETCH NEXT FROM tour_cursor INTO @id_turn
+        END
+        
+        CLOSE tour_cursor
+        DEALLOCATE tour_cursor
     END
 END;
+GO
 
--- Trigger pour vérifier que les actions sont faites pendant le tour correspondant
-CREATE OR ALTER TRIGGER trg_validate_action_time
-ON players_play
-AFTER INSERT, UPDATE
+-- ===============================================================================================
+-- TRIGGER 2 : Déclencher la procédure USERNAME_TO_LOWER quand un joueur s'inscrit
+-- ===============================================================================================
+CREATE TRIGGER TR_USERNAME_TO_LOWER_ON_INSERT
+ON players
+AFTER INSERT
 AS
 BEGIN
-    SET NOCOUNT ON;
+    -- Récupérer les IDs des joueurs qui viennent d'être insérés
+    DECLARE @id_player INT
     
-    -- Vérifier que les actions sont soumises pendant le temps alloué au tour
+    -- Parcourir tous les joueurs nouvellement inscrits
+    DECLARE player_cursor CURSOR FOR
+        SELECT id_player FROM inserted;
+        
+    OPEN player_cursor
+    FETCH NEXT FROM player_cursor INTO @id_player
+    
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- Exécuter la procédure USERNAME_TO_LOWER pour chaque joueur inséré
+        EXEC USERNAME_TO_LOWER @id_player
+        
+        FETCH NEXT FROM player_cursor INTO @id_player
+    END
+    
+    CLOSE player_cursor
+    DEALLOCATE player_cursor
+END;
+GO
+
+-- ===============================================================================================
+-- TRIGGER 3 : Vérifier qu'un joueur n'est pas dans plusieurs parties actives simultanément
+-- ===============================================================================================
+CREATE TRIGGER TR_CHECK_PLAYER_NOT_IN_MULTIPLE_ACTIVE_GAMES
+ON players_in_parties
+FOR INSERT
+AS
+BEGIN
+    -- Vérifier si un des joueurs insérés est déjà dans une partie active
     IF EXISTS (
-        SELECT 1
+        SELECT 1 
         FROM inserted i
-        JOIN turns t ON i.id_turn = t.id_turn
-        WHERE i.start_time < t.start_time OR i.end_time > t.end_time
+        JOIN players_in_parties pip ON i.id_player = pip.id_player
+        JOIN parties p ON pip.id_party = p.id_party
+        WHERE p.end_time IS NULL 
+        AND p.id_party <> i.id_party
     )
     BEGIN
-        RAISERROR('Les actions doivent être soumises pendant le temps alloué au tour.', 16, 1);
-        ROLLBACK TRANSACTION;
+        RAISERROR('Un joueur ne peut pas participer à plusieurs parties actives simultanément.', 16, 1)
+        ROLLBACK TRANSACTION
     END
 END;
-
--- Trigger pour mettre à jour l'état "is_alive" des joueurs après une action
-CREATE OR ALTER TRIGGER trg_update_player_status
-ON players_play
-AFTER INSERT, UPDATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-    
-    DECLARE @tour_id INT;
-    DECLARE @party_id INT;
-    
-    -- Récupérer le tour et la partie concernés
-    SELECT TOP 1 @tour_id = i.id_turn 
-    FROM inserted i;
-    
-    SELECT @party_id = id_party 
-    FROM turns 
-    WHERE id_turn = @tour_id;
-    
-    -- Exécuter la procédure pour compléter le tour
-    EXEC COMPLETE_TOUR @tour_id, @party_id;
-END;
+GO

@@ -1,248 +1,173 @@
 -- wv_procs.sql
 USE loupgaroudb;
 
--- Procédure SEED_DATA : crée autant de tours de jeu que la partie peut en accepter
-CREATE OR ALTER PROCEDURE SEED_DATA
-    @NB_PLAYERS INT,
-    @PARTY_ID INT
-AS
-BEGIN
-    SET NOCOUNT ON;
-    
-    DECLARE @max_tours INT = 10; -- Nombre arbitraire de tours
-    DECLARE @wolf_role_id INT;
-    DECLARE @villager_role_id INT;
-    
-    -- Obtenir les IDs des rôles
-    SELECT @wolf_role_id = id_role FROM roles WHERE description_role = 'loup';
-    SELECT @villager_role_id = id_role FROM roles WHERE description_role = 'villageois';
-    
-    -- Créer des joueurs si nécessaire
-    DECLARE @i INT = 1;
-    WHILE @i <= @NB_PLAYERS
-    BEGIN
-        -- Vérifier si le joueur existe déjà
-        IF NOT EXISTS (SELECT 1 FROM players WHERE pseudo = 'Player' + CAST(@i AS NVARCHAR(10)))
-        BEGIN
-            -- Créer un nouveau joueur
-            INSERT INTO players (id_player, pseudo)
-            VALUES (@i, 'Player' + CAST(@i AS NVARCHAR(10)));
-        END
-        
-        -- Ajouter le joueur à la partie s'il n'y est pas déjà
-        IF NOT EXISTS (SELECT 1 FROM players_in_parties WHERE id_party = @PARTY_ID AND id_player = @i)
-        BEGIN
-            -- Attribuer un rôle en utilisant la fonction random_role
-            DECLARE @role_id INT;
-            SELECT @role_id = dbo.random_role(@PARTY_ID);
-            
-            INSERT INTO players_in_parties (id_party, id_player, id_role, is_alive)
-            VALUES (@PARTY_ID, @i, @role_id, 'yes');
-        END
-        
-        SET @i = @i + 1;
-    END
-    
-    -- Créer des tours de jeu
-    DECLARE @tour_number INT = 1;
-    WHILE @tour_number <= @max_tours
-    BEGIN
-        -- Vérifier si le tour existe déjà
-        IF NOT EXISTS (SELECT 1 FROM turns WHERE id_party = @PARTY_ID AND id_turn = @tour_number)
-        BEGIN
-            -- Créer un nouveau tour
-            INSERT INTO turns (id_turn, id_party, start_time, end_time)
-            VALUES (@tour_number, @PARTY_ID, 
-                   DATEADD(MINUTE, (@tour_number - 1) * 5, GETDATE()), 
-                   DATEADD(MINUTE, @tour_number * 5, GETDATE()));
-        END
-        
-        SET @tour_number = @tour_number + 1;
-    END
-    
-    -- Générer des actions aléatoires pour les joueurs
-    DECLARE @current_tour INT = 1;
-    WHILE @current_tour <= @max_tours
-    BEGIN
-        DECLARE player_cursor CURSOR FOR 
-        SELECT id_player FROM players_in_parties 
-        WHERE id_party = @PARTY_ID AND is_alive = 'yes';
-        
-        DECLARE @current_player_id INT;
-        OPEN player_cursor;
-        FETCH NEXT FROM player_cursor INTO @current_player_id;
-        
-        WHILE @@FETCH_STATUS = 0
-        BEGIN
-            -- Vérifier si le joueur a déjà une action pour ce tour
-            IF NOT EXISTS (SELECT 1 FROM players_play WHERE id_turn = @current_tour AND id_player = @current_player_id)
-            BEGIN
-                -- Générer une position aléatoire pour l'origine et la cible
-                DECLARE @origin_row INT = CAST(RAND() * 10 AS INT) + 1;
-                DECLARE @origin_col INT = CAST(RAND() * 10 AS INT) + 1;
-                DECLARE @target_row INT, @target_col INT;
-                
-                SELECT TOP 1 @target_row = row_pos, @target_col = col_pos 
-                FROM dbo.random_position(10, 10, @PARTY_ID);
-                
-                -- Créer l'action
-                INSERT INTO players_play (
-                    id_player, id_turn, start_time, end_time, action, 
-                    origin_position_row, origin_position_col,
-                    target_position_row, target_position_col
-                )
-                VALUES (
-                    @current_player_id, @current_tour, 
-                    (SELECT start_time FROM turns WHERE id_turn = @current_tour),
-                    DATEADD(SECOND, CAST(RAND() * 240 AS INT), (SELECT start_time FROM turns WHERE id_turn = @current_tour)),
-                    'move',
-                    CAST(@origin_row AS TEXT), CAST(@origin_col AS TEXT),
-                    CAST(@target_row AS TEXT), CAST(@target_col AS TEXT)
-                );
-            END
-            
-            FETCH NEXT FROM player_cursor INTO @current_player_id;
-        END
-        
-        CLOSE player_cursor;
-        DEALLOCATE player_cursor;
-        
-        SET @current_tour = @current_tour + 1;
-    END
-END;
-
--- Procédure COMPLETE_TOUR : applique toutes les demandes de déplacement
+-- Procédure pour terminer un tour et appliquer les règles du jeu
 CREATE OR ALTER PROCEDURE COMPLETE_TOUR
-    @TOUR_ID INT,
-    @PARTY_ID INT
 AS
 BEGIN
     SET NOCOUNT ON;
     
-    -- Vérifier que le tour appartient à la partie spécifiée
-    IF NOT EXISTS (SELECT 1 FROM turns WHERE id_turn = @TOUR_ID AND id_party = @PARTY_ID)
-    BEGIN
-        RAISERROR('Le tour spécifié n''appartient pas à la partie indiquée.', 16, 1);
-        RETURN;
-    END
+    -- Récupération du dernier tour modifié
+    DECLARE @turn_id INT, @party_id INT, @turn_end_time DATETIME;
     
-    -- Détecter et résoudre les conflits de déplacement (deux joueurs voulant aller sur la même case)
-    -- En cas de conflit, nous gardons la première action soumise
-    WITH ConflictingMoves AS (
+    SELECT TOP 1 
+        @turn_id = id_turn,
+        @party_id = id_party,
+        @turn_end_time = end_time
+    FROM turns
+    WHERE end_time IS NOT NULL
+    ORDER BY end_time DESC;
+    
+    IF @turn_id IS NULL RETURN;
+    
+    -- Mettre à jour les joueurs éliminés
+    -- Un villageois est éliminé s'il se trouve sur la même case qu'un loup à la fin du tour
+    WITH LastPositions AS (
         SELECT 
             pp.id_player,
-            pp.target_position_row,
-            pp.target_position_col,
-            ROW_NUMBER() OVER (
-                PARTITION BY pp.target_position_row, pp.target_position_col 
-                ORDER BY pp.end_time
-            ) AS move_rank
-        FROM 
-            players_play pp
-        WHERE 
-            pp.id_turn = @TOUR_ID
-    )
-    -- Mettre à jour les positions des joueurs dans les tours suivants
-    -- Les joueurs dont les mouvements causent des conflits restent à leur position d'origine
-    UPDATE pp
-    SET 
-        target_position_row = pp.origin_position_row,
-        target_position_col = pp.origin_position_col
-    FROM 
-        players_play pp
-    JOIN 
-        ConflictingMoves cm ON pp.id_player = cm.id_player
-                            AND pp.target_position_row = cm.target_position_row
-                            AND pp.target_position_col = cm.target_position_col
-    WHERE 
-        pp.id_turn = @TOUR_ID
-        AND cm.move_rank > 1;
-    
-    -- Identifier les villageois qui se retrouvent sur la même case qu'un loup
-    WITH PlayerPositions AS (
-        SELECT 
-            pp.id_player,
-            pip.id_role,
             pp.target_position_row,
             pp.target_position_col
-        FROM 
-            players_play pp
-        JOIN 
-            players_in_parties pip ON pp.id_player = pip.id_player
-        JOIN
-            turns t ON pp.id_turn = t.id_turn AND pip.id_party = t.id_party
-        WHERE 
-            pp.id_turn = @TOUR_ID
-            AND t.id_party = @PARTY_ID
-            AND pip.is_alive = 'yes'
+        FROM players_play pp
+        WHERE pp.id_turn = @turn_id
     ),
     WolfPositions AS (
         SELECT 
-            target_position_row,
-            target_position_col
-        FROM 
-            PlayerPositions
-        JOIN
-            roles r ON PlayerPositions.id_role = r.id_role
-        WHERE 
-            r.description_role = 'loup'
-    ),
-    EliminatedVillagers AS (
-        SELECT DISTINCT
-            vp.id_player
-        FROM 
-            PlayerPositions vp
-        JOIN
-            WolfPositions wp ON vp.target_position_row = wp.target_position_row
-                            AND vp.target_position_col = wp.target_position_col
-        JOIN
-            roles r ON vp.id_role = r.id_role
-        WHERE 
-            r.description_role = 'villageois'
+            lp.target_position_row,
+            lp.target_position_col
+        FROM LastPositions lp
+        JOIN players_in_parties pip ON lp.id_player = pip.id_player
+        JOIN roles r ON pip.id_role = r.id_role
+        WHERE pip.id_party = @party_id
+          AND r.description_role = 'loup'
+          AND pip.is_alive = 'yes'
     )
-    -- Marquer les villageois éliminés
-    UPDATE players_in_parties
+    UPDATE pip
     SET is_alive = 'no'
     FROM players_in_parties pip
-    JOIN EliminatedVillagers ev ON pip.id_player = ev.id_player
-    WHERE pip.id_party = @PARTY_ID;
+    JOIN roles r ON pip.id_role = r.id_role
+    JOIN LastPositions lp ON pip.id_player = lp.id_player
+    WHERE pip.id_party = @party_id
+      AND r.description_role = 'villageois'
+      AND pip.is_alive = 'yes'
+      AND EXISTS (
+        SELECT 1 FROM WolfPositions wp
+        WHERE wp.target_position_row = lp.target_position_row
+          AND wp.target_position_col = lp.target_position_col
+      );
     
-    -- Vérifier s'il reste des villageois vivants
-    IF NOT EXISTS (
-        SELECT 1 
-        FROM players_in_parties pip
-        JOIN roles r ON pip.id_role = r.id_role
-        WHERE pip.id_party = @PARTY_ID 
-              AND r.description_role = 'villageois' 
-              AND pip.is_alive = 'yes'
-    )
+    -- Vérifier si la partie est terminée (tous les villageois morts)
+    DECLARE @villageois_vivants INT;
+    
+    SELECT @villageois_vivants = COUNT(*)
+    FROM players_in_parties pip
+    JOIN roles r ON pip.id_role = r.id_role
+    WHERE pip.id_party = @party_id
+      AND r.description_role = 'villageois'
+      AND pip.is_alive = 'yes';
+    
+    -- Si tous les villageois sont morts, marquer la partie comme terminée
+    IF @villageois_vivants = 0
     BEGIN
-        -- Tous les villageois sont éliminés, les loups gagnent
-        PRINT 'Les loups gagnent!';
+        UPDATE parties
+        SET 
+            end_time = @turn_end_time,
+            winner = 'loup'
+        WHERE id_party = @party_id;
+        
+        PRINT 'Partie ' + CAST(@party_id AS VARCHAR) + ' terminée. Victoire des loups!';
     END
-    ELSE
-    BEGIN
-        -- Vérifier si c'est le dernier tour
-        IF NOT EXISTS (SELECT 1 FROM turns WHERE id_party = @PARTY_ID AND id_turn > @TOUR_ID)
-        BEGIN
-            -- C'est le dernier tour et il reste des villageois, les villageois gagnent
-            PRINT 'Les villageois gagnent!';
-        END
-    END
+    
+    -- Pour les tests, afficher un message sur les joueurs éliminés
+    PRINT 'Tour ' + CAST(@turn_id AS VARCHAR) + ' de la partie ' + CAST(@party_id AS VARCHAR) + ' terminé.';
+    PRINT 'Villageois restants: ' + CAST(@villageois_vivants AS VARCHAR);
 END;
 
--- Procédure USERNAME_TO_LOWER : met les noms des joueurs en minuscule
+-- Procédure pour convertir le pseudo du joueur en minuscules
 CREATE OR ALTER PROCEDURE USERNAME_TO_LOWER
 AS
 BEGIN
     SET NOCOUNT ON;
     
-    -- Mise à jour de tous les noms de joueurs en minuscule
     UPDATE players
-    SET pseudo = LOWER(pseudo)
-    WHERE pseudo != LOWER(pseudo);
+    SET pseudo = LOWER(pseudo);
     
-    -- Affiche le nombre de noms mis à jour
-    DECLARE @updated_count INT = @@ROWCOUNT;
-    PRINT CAST(@updated_count AS NVARCHAR(10)) + ' noms de joueurs ont été convertis en minuscules.';
+    PRINT 'Les pseudos de tous les joueurs ont été convertis en minuscules.';
+END;
+
+-- Procédure pour générer des données de test
+CREATE OR ALTER PROCEDURE SEED_DATA
+    @nb_players INT,
+    @party_id INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    -- Création de tours pour la partie
+    DECLARE @start_time DATETIME = GETDATE();
+    DECLARE @nb_turns INT = 5; -- Nombre de tours à créer
+    DECLARE @i INT = 1;
+    
+    WHILE @i <= @nb_turns
+    BEGIN
+        INSERT INTO turns (id_turn, id_party, start_time, end_time)
+        VALUES (
+            (SELECT ISNULL(MAX(id_turn), 0) FROM turns) + @i,
+            @party_id,
+            DATEADD(MINUTE, (@i-1)*10, @start_time),
+            DATEADD(MINUTE, @i*10, @start_time)
+        );
+        
+        SET @i = @i + 1;
+    END;
+    
+    -- Création des joueurs s'il n'y en a pas assez
+    DECLARE @nb_existing_players INT;
+    SELECT @nb_existing_players = COUNT(*) FROM players;
+    
+    IF @nb_existing_players < @nb_players
+    BEGIN
+        DECLARE @j INT = @nb_existing_players + 1;
+        
+        WHILE @j <= @nb_players
+        BEGIN
+            INSERT INTO players (id_player, pseudo)
+            VALUES (
+                (SELECT ISNULL(MAX(id_player), 0) FROM players) + 1,
+                'Player' + CAST(@j AS VARCHAR)
+            );
+            
+            SET @j = @j + 1;
+        END;
+    END;
+    
+    -- Ajouter des joueurs à la partie avec des rôles équilibrés
+    DECLARE @player_id INT;
+    
+    -- Identifier les joueurs qui ne sont pas déjà dans la partie
+    DECLARE player_cursor CURSOR FOR
+    SELECT p.id_player
+    FROM players p
+    WHERE NOT EXISTS (
+        SELECT 1 FROM players_in_parties
+        WHERE id_party = @party_id AND id_player = p.id_player
+    )
+    ORDER BY NEWID()
+    OFFSET 0 ROWS FETCH NEXT @nb_players ROWS ONLY;
+    
+    OPEN player_cursor;
+    FETCH NEXT FROM player_cursor INTO @player_id;
+    
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- Attribuer un rôle aléatoirement en utilisant la fonction random_role
+        INSERT INTO players_in_parties (id_party, id_player, id_role, is_alive)
+        VALUES (@party_id, @player_id, dbo.random_role(@party_id), 'yes');
+        
+        FETCH NEXT FROM player_cursor INTO @player_id;
+    END;
+    
+    CLOSE player_cursor;
+    DEALLOCATE player_cursor;
+    
+    PRINT 'Données générées pour la partie ' + CAST(@party_id AS VARCHAR) + ' avec ' + CAST(@nb_players AS VARCHAR) + ' joueurs';
 END;

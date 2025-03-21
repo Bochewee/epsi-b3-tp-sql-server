@@ -16,45 +16,47 @@ IF EXISTS (SELECT * FROM sys.tables WHERE name = 'parties')
     DROP TABLE parties;
 GO
 
--- Création des tables
-create table parties (
-    id_party int,
-    title_party text
+-- Création des tables avec types corrects
+CREATE TABLE parties (
+    id_party INT,
+    title_party VARCHAR(255),
+    winner VARCHAR(20),  -- Ajouté pour la contrainte CHK_parties_winner
+    end_time DATETIME    -- Ajouté pour l'index IDX_parties_status
 );
 
-create table roles (
-    id_role int,
-    description_role text
+CREATE TABLE roles (
+    id_role INT,
+    description_role VARCHAR(255)
 );
 
-create table players (
-    id_player int,
-    pseudo text
+CREATE TABLE players (
+    id_player INT,
+    pseudo VARCHAR(100)  -- Changé de TEXT à VARCHAR pour pouvoir l'indexer
 );
 
-create table players_in_parties (
-    id_party int,
-    id_player int,
-    id_role int,
-    is_alive text
+CREATE TABLE players_in_parties (
+    id_party INT,
+    id_player INT,
+    id_role INT,
+    is_alive BIT         -- Changé de TEXT à BIT pour la contrainte
 );
 
-create table turns (
-    id_turn int,
-    id_party int,
-    start_time datetime,
-    end_time datetime
+CREATE TABLE turns (
+    id_turn INT,
+    id_party INT,
+    start_time DATETIME,
+    end_time DATETIME
 );
 
-create table players_play (
-    id_player int,
-    id_turn int,
-    start_time datetime,
-    end_time datetime,
-    action varchar(10),
-    origin_position_col text,
-    origin_position_row text,
-    target_position_col text,
-    target_position_row text
+CREATE TABLE players_play (
+    id_player INT,
+    id_turn INT,
+    start_time DATETIME,
+    end_time DATETIME,
+    action VARCHAR(10),
+    origin_position_col INT,  -- Changé de TEXT à INT
+    origin_position_row INT,  -- Changé de TEXT à INT
+    target_position_col INT,  -- Changé de TEXT à INT
+    target_position_row INT   -- Changé de TEXT à INT pour l'index
 );
 GO
