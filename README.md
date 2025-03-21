@@ -36,6 +36,3 @@ Triggers pour maintenir l'intégrité des données et automatiser certains proce
 
 ### Optimisation
 Indexes et contraintes pour optimiser les performances de la base de données.
-
-## Instructions d'installation
-1. Exécutez les scripts dans l'ordre suivant:
